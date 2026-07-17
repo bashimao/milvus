@@ -43,7 +43,9 @@ import (
 	"github.com/milvus-io/milvus/internal/util/schemautil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -579,6 +581,7 @@ func TestDDLCallbacksBroadcastAlterCollectionSchema(t *testing.T) {
 	existingOutputFieldSchema := &schemapb.FieldSchema{
 		Name:     "existing_minhash_output",
 		DataType: schemapb.DataType_BinaryVector,
+		Nullable: true,
 		TypeParams: []*commonpb.KeyValuePair{
 			{Key: common.DimKey, Value: "4096"},
 		},
@@ -607,7 +610,7 @@ func TestDDLCallbacksBroadcastAlterCollectionSchema(t *testing.T) {
 	require.ErrorIs(t, merr.CheckRPCCall(resp.GetAlterStatus(), err), merr.ErrParameterInvalid)
 	require.Contains(t, resp.GetAlterStatus().GetReason(), "output field missing_minhash_output_late")
 
-	// happy path: add only a function and mark an existing output field.
+	// Function-only add cannot relabel an existing field as a function output.
 	functionOnlyReq := buildAlterSchemaAddFunctionReq(dbName, collectionName, &schemapb.FunctionSchema{
 		Name:             "minhash_existing_fn",
 		Type:             schemapb.FunctionType_MinHash,
@@ -621,16 +624,18 @@ func TestDDLCallbacksBroadcastAlterCollectionSchema(t *testing.T) {
 		},
 	})
 	resp, err = core.AlterCollectionSchema(ctx, functionOnlyReq)
-	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
-	assertSchemaVersion(t, ctx, core, dbName, collectionName, 7)
+	alterErr = merr.CheckRPCCall(resp.GetAlterStatus(), err)
+	require.ErrorIs(t, alterErr, merr.ErrParameterInvalid)
+	require.ErrorContains(t, alterErr, "cannot repurpose existing field")
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 6)
 	coll, err = core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
 	require.NoError(t, err)
-	require.Len(t, coll.Functions, 2)
+	require.Len(t, coll.Functions, 1)
 	existingOutputFound := false
 	for _, field := range coll.Fields {
 		if field.Name == "existing_minhash_output" {
 			existingOutputFound = true
-			require.True(t, field.IsFunctionOutput)
+			require.False(t, field.IsFunctionOutput)
 		}
 	}
 	require.True(t, existingOutputFound)
@@ -654,19 +659,19 @@ func TestDDLCallbacksBroadcastAlterCollectionSchema(t *testing.T) {
 	firstAlterReq := buildAlterSchemaReq(dbName, collectionName, "text_input", "sparse_output", "bm25_fn")
 	resp, err = core.AlterCollectionSchema(ctx, firstAlterReq)
 	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
-	assertSchemaVersion(t, ctx, core, dbName, collectionName, 8)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 7)
 
 	// second happy path with DoPhysicalBackfill=true: the flag is ignored by alter schema.
 	secondAlterReq := buildAlterSchemaReq(dbName, collectionName, "text_input", "sparse_output2", "bm25_fn2")
 	secondAlterReq.GetAction().GetAddRequest().DoPhysicalBackfill = true
 	resp, err = core.AlterCollectionSchema(ctx, secondAlterReq)
 	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
-	assertSchemaVersion(t, ctx, core, dbName, collectionName, 9)
+	assertSchemaVersion(t, ctx, core, dbName, collectionName, 8)
 	updated, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
 	require.NoError(t, err)
 	schema := updated.ToCollectionSchemaPB()
 	require.False(t, schema.GetDoPhysicalBackfill())
-	require.EqualValues(t, 9, schema.GetVersion())
+	require.EqualValues(t, 8, schema.GetVersion())
 
 	// case 9: function already exists (same name "bm25_fn")
 	resp, err = core.AlterCollectionSchema(ctx, &milvuspb.AlterCollectionSchemaRequest{
@@ -726,7 +731,73 @@ func TestDDLCallbacksBroadcastAlterCollectionSchema(t *testing.T) {
 	require.Error(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
 }
 
-func TestDDLCallbacksAlterCollectionSchemaValidatesFunctionOnlyFinalSchema(t *testing.T) {
+func TestDDLCallbacksAlterCollectionSchemaAnalyzerFileResourceRefs(t *testing.T) {
+	core := initStreamingSystemAndCore(t)
+
+	ctx := context.Background()
+	dbName := "testDB" + funcutil.RandomString(10)
+	collectionName := "testCollection" + funcutil.RandomString(10)
+	fieldName := "schema_text_with_dict"
+
+	createCollectionForTest(t, ctx, core, dbName, collectionName)
+
+	meta := core.meta.(*MetaTable)
+	resourceID := int64(10002)
+	meta.fileResourceName2Meta = map[string]*internalpb.FileResourceInfo{
+		"schema_dict": {Id: resourceID, Name: "schema_dict", Path: "schema_dict.txt"},
+	}
+	meta.fileResourceID2Meta = map[int64]*internalpb.FileResourceInfo{
+		resourceID: {Id: resourceID, Name: "schema_dict", Path: "schema_dict.txt"},
+	}
+	meta.fileResourceRefCnt = map[int64]int{}
+
+	mixCoord := core.mixCoord.(*imocks.MixCoord)
+	mixCoord.EXPECT().ValidateAnalyzer(mock.Anything, mock.MatchedBy(func(req *querypb.ValidateAnalyzerRequest) bool {
+		infos := req.GetAnalyzerInfos()
+		return len(infos) == 1 &&
+			infos[0].GetField() == fieldName &&
+			infos[0].GetParams() == `{"tokenizer":"standard"}`
+	})).Return(&querypb.ValidateAnalyzerResponse{
+		Status:      merr.Success(),
+		ResourceIds: []int64{resourceID},
+	}, nil).Once()
+
+	resp, err := core.AlterCollectionSchema(ctx, buildAlterSchemaAddFieldSchemaReq(dbName, collectionName, &schemapb.FieldSchema{
+		Name:     fieldName,
+		DataType: schemapb.DataType_VarChar,
+		Nullable: true,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.MaxLengthKey, Value: "128"},
+			{Key: common.EnableAnalyzerKey, Value: "true"},
+			{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+		},
+	}, false))
+	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
+	coll, err := core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []int64{resourceID}, coll.FileResourceIds)
+	require.Equal(t, 1, meta.fileResourceRefCnt[resourceID])
+
+	resp, err = core.AlterCollectionSchema(ctx, &milvuspb.AlterCollectionSchemaRequest{
+		DbName:         dbName,
+		CollectionName: collectionName,
+		Action: &milvuspb.AlterCollectionSchemaRequest_Action{
+			Op: &milvuspb.AlterCollectionSchemaRequest_Action_DropRequest{
+				DropRequest: &milvuspb.AlterCollectionSchemaRequest_DropRequest{
+					Identifier: &milvuspb.AlterCollectionSchemaRequest_DropRequest_FieldName{FieldName: fieldName},
+				},
+			},
+		},
+	})
+	require.NoError(t, merr.CheckRPCCall(resp.GetAlterStatus(), err))
+	coll, err = core.meta.GetCollectionByName(ctx, dbName, collectionName, typeutil.MaxTimestamp, false)
+	require.NoError(t, err)
+	require.Empty(t, coll.FileResourceIds)
+	require.Equal(t, 0, meta.fileResourceRefCnt[resourceID])
+	assertFieldNotExists(t, ctx, core, dbName, collectionName, fieldName)
+}
+
+func TestDDLCallbacksAlterCollectionSchemaRejectsFunctionOnlyMaterializedOutput(t *testing.T) {
 	core := initStreamingSystemAndCore(t)
 
 	ctx := context.Background()
@@ -754,6 +825,7 @@ func TestDDLCallbacksAlterCollectionSchemaValidatesFunctionOnlyFinalSchema(t *te
 	invalidOutputBytes, err := proto.Marshal(&schemapb.FieldSchema{
 		Name:     "invalid_minhash_output",
 		DataType: schemapb.DataType_FloatVector,
+		Nullable: true,
 		TypeParams: []*commonpb.KeyValuePair{
 			{Key: common.DimKey, Value: "128"},
 		},
@@ -781,7 +853,7 @@ func TestDDLCallbacksAlterCollectionSchemaValidatesFunctionOnlyFinalSchema(t *te
 	}))
 	alterErr := merr.CheckRPCCall(resp.GetAlterStatus(), err)
 	require.ErrorIs(t, alterErr, merr.ErrParameterInvalid)
-	require.ErrorContains(t, alterErr, "MinHash function output field must be a BinaryVector field")
+	require.ErrorContains(t, alterErr, "cannot repurpose existing field")
 	assertSchemaVersion(t, ctx, core, dbName, collectionName, 2)
 }
 
@@ -955,6 +1027,7 @@ func TestDDLCallbacksAlterCollectionSchemaAddSkipsSchemaDropReady(t *testing.T) 
 	varcharFieldSchema := &schemapb.FieldSchema{
 		Name:     "text_input",
 		DataType: schemapb.DataType_VarChar,
+		Nullable: true,
 		TypeParams: []*commonpb.KeyValuePair{
 			{Key: common.MaxLengthKey, Value: "256"},
 			{Key: common.EnableAnalyzerKey, Value: "true"},
